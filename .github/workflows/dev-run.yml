@@ -1,0 +1,87 @@
+name: dev-run
+# Public runner shell: the harness lives in a private repo. This job checks it
+# out with a token, runs dev tasks, and pushes results back to that private
+# repo (branch dev-results). Nothing but a short score table appears here.
+on:
+  workflow_dispatch:
+    inputs:
+      tasks:
+        description: "comma-separated dev task ids, or all"
+        default: "wind-diaphragm-shear"
+      judge_model:
+        description: "judge model served by the local proxy"
+        default: "gemma-4-26b"
+      ref:
+        description: "branch or commit of the private harness"
+        default: "main"
+      label:
+        description: "short label for this run (ablation name)"
+        default: "dev"
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PRIVATE_REPO: Apihpih96/ple-audited-harness
+    steps:
+      - name: Check out private harness
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          path: harness
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true; df -h / | tail -1; nproc; free -g | head -2
+      - name: Install uv, Harbor, PLE kit
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          uv tool install harbor==0.20.0 --with websockets >/dev/null
+          git clone -q --depth 1 https://github.com/google-research/ple "$RUNNER_TEMP/ple"
+          (cd "$RUNNER_TEMP/ple" && uv sync -q)
+      - name: Dev run
+        working-directory: harness
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TASKS: ${{ inputs.tasks }}
+          JUDGE_MODEL: ${{ inputs.judge_model }}
+        # Full output goes to a file that is pushed privately; the public log
+        # only shows the final score table.
+        run: |
+          set +e
+          KIT="$RUNNER_TEMP/ple" bash tools/dev_free.sh > "$RUNNER_TEMP/devrun_full.log" 2>&1
+          rc=$?
+          sed -n '/^task  *score/,/^results:/p' "$RUNNER_TEMP/devrun_full.log" | grep -v '^results:'
+          echo "exit code $rc"
+          exit 0
+      - name: Push results to private repo
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_PAT }}
+        run: |
+          set -e
+          OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT"
+          NAME="$(date -u +%Y%m%d-%H%M%S)-${{ inputs.label }}-${GITHUB_RUN_ID}"
+          R=$(ls -d "$RUNNER_TEMP"/ple/runs/*/ 2>/dev/null | tail -1 || true)
+          cp "$RUNNER_TEMP/devrun_full.log" "$OUT/devrun.log" 2>/dev/null || true
+          tail -n 200 /tmp/proxy.log > "$OUT/proxy_tail.log" 2>/dev/null || true
+          [ -n "$R" ] && cp "$R/results.json" "$OUT/results.json" 2>/dev/null || true
+          [ -n "$R" ] && tar -czf "$OUT/run.tar.gz" -C "$R" . 2>/dev/null || true
+          # keep under GitHub's 100 MB file limit
+          if [ -f "$OUT/run.tar.gz" ] && [ $(stat -c%s "$OUT/run.tar.gz") -gt 95000000 ]; then
+            rm "$OUT/run.tar.gz"; echo "run.tar.gz too large, dropped" > "$OUT/NOTE.txt"
+          fi
+          printf 'tasks=%s\nref=%s\njudge=%s\nrunner_run=%s\n' "${{ inputs.tasks }}" "${{ inputs.ref }}" "${{ inputs.judge_model }}" "$GITHUB_RUN_ID" > "$OUT/meta.txt"
+          git clone -q --depth 1 --branch dev-results "https://x-access-token:${GH_TOKEN}@github.com/${PRIVATE_REPO}.git" store 2>/dev/null || {
+            git clone -q --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${PRIVATE_REPO}.git" store
+            (cd store && git checkout -q --orphan dev-results && git rm -rq . && echo "# dev run results" > README.md && git add README.md)
+          }
+          mkdir -p "store/results/$NAME" && cp -r "$OUT"/. "store/results/$NAME/"
+          cd store
+          git config user.name "ple-runner"; git config user.email "ple-runner@users.noreply.github.com"
+          git add -A && git commit -qm "results $NAME"
+          for i in 1 2 3; do git push -q origin dev-results && break; git pull -q --rebase origin dev-results; done
+          echo "stored results/$NAME"

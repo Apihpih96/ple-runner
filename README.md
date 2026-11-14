@@ -1,2 +1,3 @@
 # ple-runner
-Runner for dev evals
+
+Workflow-only runner for dev evaluations. The code it runs lives elsewhere.

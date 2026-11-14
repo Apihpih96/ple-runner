@@ -46,14 +46,17 @@ jobs:
           (cd "$RUNNER_TEMP/ple" && uv sync -q)
       - name: Kit check
         if: inputs.mode == 'check'
+        working-directory: harness
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          JUDGE_MODEL: ${{ inputs.judge_model }}
         run: |
           set +e
-          cd "$RUNNER_TEMP/ple"
-          # --no-smoke makes no model calls, but the kit still wants a proxy set.
-          export MODEL_PROXY_URL="${MODEL_PROXY_URL:-http://127.0.0.1:4000}" MODEL_PROXY_KEY="${MODEL_PROXY_KEY:-unused}"
-          uv run python -m kit check "$GITHUB_WORKSPACE/harness" --no-smoke > "$RUNNER_TEMP/devrun_full.log" 2>&1
+          git fetch -q --unshallow 2>/dev/null
+          CHECK_ONLY=1 KIT="$RUNNER_TEMP/ple" bash tools/dev_free.sh > "$RUNNER_TEMP/devrun_full.log" 2>&1
           rc=$?
-          grep -E '^\[(PASS|FAIL|WARN|SKIP)\]|^ok|error' "$RUNNER_TEMP/devrun_full.log" | cut -c1-200
+          grep -E '^\[(PASS|FAIL|WARN|SKIP)\]' "$RUNNER_TEMP/devrun_full.log" | cut -c1-200
           echo "exit code $rc"
       - name: Dev run
         if: inputs.mode != 'check'

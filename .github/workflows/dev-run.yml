@@ -17,6 +17,9 @@ on:
       label:
         description: "short label for this run (ablation name)"
         default: "dev"
+      mode:
+        description: "dev = run tasks; check = kit check --no-smoke (build + listen, no model calls)"
+        default: "dev"
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -41,7 +44,17 @@ jobs:
           uv tool install harbor==0.20.0 --with websockets >/dev/null
           git clone -q --depth 1 https://github.com/google-research/ple "$RUNNER_TEMP/ple"
           (cd "$RUNNER_TEMP/ple" && uv sync -q)
+      - name: Kit check
+        if: inputs.mode == 'check'
+        run: |
+          set +e
+          cd "$RUNNER_TEMP/ple"
+          uv run python -m kit check "$GITHUB_WORKSPACE/harness" --no-smoke > "$RUNNER_TEMP/devrun_full.log" 2>&1
+          rc=$?
+          grep -E '^\[(PASS|FAIL|WARN|SKIP)\]|^ok|error' "$RUNNER_TEMP/devrun_full.log" | cut -c1-200
+          echo "exit code $rc"
       - name: Dev run
+        if: inputs.mode != 'check'
         working-directory: harness
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

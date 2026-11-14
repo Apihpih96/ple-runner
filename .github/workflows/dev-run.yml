@@ -49,6 +49,8 @@ jobs:
         run: |
           set +e
           cd "$RUNNER_TEMP/ple"
+          # --no-smoke makes no model calls, but the kit still wants a proxy set.
+          export MODEL_PROXY_URL="${MODEL_PROXY_URL:-http://127.0.0.1:4000}" MODEL_PROXY_KEY="${MODEL_PROXY_KEY:-unused}"
           uv run python -m kit check "$GITHUB_WORKSPACE/harness" --no-smoke > "$RUNNER_TEMP/devrun_full.log" 2>&1
           rc=$?
           grep -E '^\[(PASS|FAIL|WARN|SKIP)\]|^ok|error' "$RUNNER_TEMP/devrun_full.log" | cut -c1-200
@@ -88,10 +90,14 @@ jobs:
             rm "$OUT/run.tar.gz"; echo "run.tar.gz too large, dropped" > "$OUT/NOTE.txt"
           fi
           printf 'tasks=%s\nref=%s\njudge=%s\nrunner_run=%s\n' "${{ inputs.tasks }}" "${{ inputs.ref }}" "${{ inputs.judge_model }}" "$GITHUB_RUN_ID" > "$OUT/meta.txt"
-          git clone -q --depth 1 --branch dev-results "https://x-access-token:${GH_TOKEN}@github.com/${PRIVATE_REPO}.git" store 2>/dev/null || {
-            git clone -q --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${PRIVATE_REPO}.git" store
-            (cd store && git checkout -q --orphan dev-results && git rm -rq . && echo "# dev run results" > README.md && git add README.md)
-          }
+          URL="https://x-access-token:${GH_TOKEN}@github.com/${PRIVATE_REPO}.git"
+          mkdir store && cd store && git init -q && git remote add origin "$URL"
+          if git fetch -q --depth 1 origin dev-results 2>/dev/null; then
+            git checkout -q -b dev-results FETCH_HEAD
+          else
+            git checkout -q --orphan dev-results && echo "# dev run results" > README.md
+          fi
+          cd ..
           mkdir -p "store/results/$NAME" && cp -r "$OUT"/. "store/results/$NAME/"
           cd store
           git config user.name "ple-runner"; git config user.email "ple-runner@users.noreply.github.com"

@@ -56,6 +56,13 @@ def get_llama():
                 t.extractall(bin_dir)
         found = [os.path.join(r, f) for r, _, fs in os.walk(bin_dir) for f in fs if f == "llama-server"]
         exe = found[0]
+        # The CUDA runtime tarball unpacks to its own folder; the backend finds
+        # libcudart/libcublas next to itself ($ORIGIN rpath), so move them there.
+        for r, _, fs in os.walk(bin_dir):
+            if os.path.basename(r).startswith("cudart-"):
+                for f in fs:
+                    shutil.copy2(os.path.join(r, f), os.path.join(os.path.dirname(exe), f))
+                log("CUDA runtime libs copied:", ", ".join(fs))
     d = os.path.dirname(exe)
     os.environ["LD_LIBRARY_PATH"] = d + ":" + os.environ.get("LD_LIBRARY_PATH", "")
     os.chmod(exe, 0o755)

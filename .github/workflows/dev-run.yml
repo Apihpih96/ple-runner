@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tasks:
-        description: "comma-separated dev task ids, or all"
+        description: "comma-separated dev task ids (each runs as its own job, one at a time)"
         default: "wind-diaphragm-shear"
       judge_model:
         description: "judge model served by the local proxy"
@@ -20,10 +20,35 @@ on:
       mode:
         description: "dev = run tasks; check = kit check --no-smoke (build + listen, no model calls)"
         default: "dev"
+# Runs share one free key, so a new run waits for the one before it.
+concurrency:
+  group: free-gemini-key
+  cancel-in-progress: false
 jobs:
-  run:
+  plan:
+    # One job per task, one at a time: each job gets its own 6-hour limit and
+    # the free key's per-minute quota is never shared between tasks.
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    outputs:
+      tasks: ${{ steps.list.outputs.tasks }}
+    steps:
+      - id: list
+        env:
+          TASKS: ${{ inputs.tasks }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$MODE" = check ]; then echo 'tasks=["check"]' >> "$GITHUB_OUTPUT"; exit 0; fi
+          T=$(echo "$TASKS" | tr -d ' ' | sed 's/,,*/,/g; s/^,//; s/,$//; s/,/","/g')
+          echo "tasks=[\"$T\"]" >> "$GITHUB_OUTPUT"
+  run:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        task: ${{ fromJSON(needs.plan.outputs.tasks) }}
     env:
       PRIVATE_REPO: Apihpih96/ple-audited-harness
     steps:
@@ -64,7 +89,7 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          TASKS: ${{ inputs.tasks }}
+          TASKS: ${{ matrix.task }}
           JUDGE_MODEL: ${{ inputs.judge_model }}
         # Full output goes to a file that is pushed privately; the public log
         # only shows the final score table.
@@ -82,7 +107,7 @@ jobs:
         run: |
           set -e
           OUT="$RUNNER_TEMP/out"; mkdir -p "$OUT"
-          NAME="$(date -u +%Y%m%d-%H%M%S)-${{ inputs.label }}-${GITHUB_RUN_ID}"
+          NAME="$(date -u +%Y%m%d-%H%M%S)-${{ inputs.label }}-${{ matrix.task }}-${GITHUB_RUN_ID}"
           R=$(ls -d "$RUNNER_TEMP"/ple/runs/*/ 2>/dev/null | tail -1 || true)
           cp "$RUNNER_TEMP/devrun_full.log" "$OUT/devrun.log" 2>/dev/null || true
           tail -n 200 /tmp/proxy.log > "$OUT/proxy_tail.log" 2>/dev/null || true
@@ -92,7 +117,7 @@ jobs:
           if [ -f "$OUT/run.tar.gz" ] && [ $(stat -c%s "$OUT/run.tar.gz") -gt 95000000 ]; then
             rm "$OUT/run.tar.gz"; echo "run.tar.gz too large, dropped" > "$OUT/NOTE.txt"
           fi
-          printf 'tasks=%s\nref=%s\njudge=%s\nrunner_run=%s\n' "${{ inputs.tasks }}" "${{ inputs.ref }}" "${{ inputs.judge_model }}" "$GITHUB_RUN_ID" > "$OUT/meta.txt"
+          printf 'tasks=%s\nref=%s\njudge=%s\nrunner_run=%s\n' "${{ matrix.task }}" "${{ inputs.ref }}" "${{ inputs.judge_model }}" "$GITHUB_RUN_ID" > "$OUT/meta.txt"
           URL="https://x-access-token:${GH_TOKEN}@github.com/${PRIVATE_REPO}.git"
           mkdir store && cd store && git init -q && git remote add origin "$URL"
           if git fetch -q --depth 1 origin dev-results 2>/dev/null; then

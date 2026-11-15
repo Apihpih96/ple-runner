@@ -20,6 +20,12 @@ on:
       mode:
         description: "dev = run tasks; check = kit check --no-smoke (build + listen, no model calls)"
         default: "dev"
+      llm:
+        description: "auto = Kaggle GPU Gemma if its server is up, else free Gemini key; kaggle = Kaggle only (fail if down); free = free Gemini key"
+        default: "auto"
+      kaggle_url:
+        description: "optional: tunnel URL of the Kaggle server (normally found automatically)"
+        default: ""
 # Runs share one free key, so a new run waits for the one before it.
 concurrency:
   group: free-gemini-key
@@ -59,6 +65,26 @@ jobs:
           ref: ${{ inputs.ref }}
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           path: harness
+      - name: Check out runner scripts
+        uses: actions/checkout@v4
+        with:
+          path: runner
+      - name: Find Kaggle GPU Gemma server
+        if: inputs.llm != 'free'
+        env:
+          KAGGLE_LLM_PRIVKEY: ${{ secrets.KAGGLE_LLM_PRIVKEY }}
+          LLM: ${{ inputs.llm }}
+          URL_IN: ${{ inputs.kaggle_url }}
+        run: |
+          pip install -q pynacl
+          if python3 runner/kaggle/endpoint.py --github; then
+            if [ -n "$URL_IN" ]; then echo "::add-mask::$URL_IN"; echo "KAGGLE_LLM_URL=$URL_IN" >> "$GITHUB_ENV"; fi
+            echo "model: Kaggle GPU Gemma 4 26B"
+          elif [ "$LLM" = kaggle ]; then
+            echo "Kaggle server not reachable and llm=kaggle"; exit 1
+          else
+            echo "model: free Gemini key (16k input tokens/min)"
+          fi
       - name: Free disk space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true; df -h / | tail -1; nproc; free -g | head -2
       - name: Install uv, Harbor, PLE kit

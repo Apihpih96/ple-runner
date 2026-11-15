@@ -59,17 +59,33 @@ def get_llama():
     d = os.path.dirname(exe)
     os.environ["LD_LIBRARY_PATH"] = d + ":" + os.environ.get("LD_LIBRARY_PATH", "")
     os.chmod(exe, 0o755)
-    out = subprocess.run([exe, "--list-devices"], capture_output=True, text=True).stdout + ""
-    log("devices:", " | ".join(l.strip() for l in out.splitlines() if "CUDA" in l) or "NONE")
+    subprocess.run("nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader; "
+                   "nvcc --version | tail -1; ls -d /usr/local/cuda* 2>/dev/null", shell=True)
+    r = subprocess.run([exe, "--list-devices"], capture_output=True, text=True)
+    out = r.stdout + r.stderr
+    log("list-devices rc", r.returncode, "\n" + out[-1200:])
     if "CUDA0" in out:
         return exe
     # Prebuilt binary cannot see the T4s: build for sm_75 with Kaggle's nvcc.
-    log("prebuilt CUDA build not usable, compiling llama.cpp for sm_75 (~10 min)")
+    log("prebuilt CUDA build not usable, compiling llama.cpp for sm_75 (~10-15 min)")
     src = f"{WORK}/llama.cpp"
     if not os.path.exists(src):
         sh(f"git clone -q --depth 1 --branch {LLAMA_TAG} https://github.com/ggml-org/llama.cpp {src}")
+    cuda = "/usr/local/cuda"
+    # Kaggle's image has no libcuda.so in the toolkit dirs cmake searches; point it at the stubs
+    # and the driver's lib so the CUDA::cuda_driver target resolves.
+    stubs = f"{cuda}/lib64/stubs"
+    drv = subprocess.run("ldconfig -p | grep -m1 'libcuda.so ' | awk '{print $NF}'", shell=True,
+                         capture_output=True, text=True).stdout.strip()
+    extra = f"-DCUDAToolkit_ROOT={cuda} -DCMAKE_CUDA_COMPILER={cuda}/bin/nvcc -DCMAKE_LIBRARY_PATH={stubs}"
+    if drv:
+        extra += f" -DCUDA_cuda_driver_LIBRARY={drv}"
+    elif os.path.exists(f"{stubs}/libcuda.so"):
+        extra += f" -DCUDA_cuda_driver_LIBRARY={stubs}/libcuda.so"
     sh(f"cd {src} && cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DLLAMA_CURL=OFF "
-       f"-DCMAKE_BUILD_TYPE=Release > /dev/null && cmake --build build -j$(nproc) --target llama-server > /dev/null")
+       f"-DLLAMA_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release {extra} 2>&1 | tail -25 "
+       f"&& cmake --build build -j$(nproc) --target llama-server 2>&1 | grep -E 'error|Error' | head -20; "
+       f"test -x build/bin/llama-server")
     return f"{src}/build/bin/llama-server"
 
 

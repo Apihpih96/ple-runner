@@ -69,6 +69,26 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: runner
+      - name: Free disk space
+        # Task images (OpenProject, venv layers) overflowed the default disk.
+        # Strip preinstalled toolchains and move Docker's storage to /mnt.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache /usr/share/swift /usr/local/share/boost /usr/local/lib/node_modules /opt/microsoft /opt/google /opt/az /usr/local/share/powershell /usr/local/share/chromium || true
+          sudo docker system prune -af >/dev/null 2>&1 || true
+          sudo systemctl stop docker docker.socket || true
+          sudo mkdir -p /mnt/docker
+          echo '{"data-root":"/mnt/docker"}' | sudo tee /etc/docker/daemon.json >/dev/null
+          sudo systemctl start docker
+          docker info --format 'docker root: {{.DockerRootDir}}'
+          df -h / /mnt | tail -2; nproc; free -g | head -2
+      - name: Install uv, Harbor, PLE kit
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          uv tool install harbor==0.20.0 --with websockets >/dev/null
+          git clone -q --depth 1 https://github.com/google-research/ple "$RUNNER_TEMP/ple"
+          (cd "$RUNNER_TEMP/ple" && uv sync -q)
       - name: Find Kaggle GPU Gemma server
         if: inputs.llm != 'free'
         env:
@@ -85,16 +105,6 @@ jobs:
           else
             echo "model: free Gemini key (16k input tokens/min)"
           fi
-      - name: Free disk space
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true; df -h / | tail -1; nproc; free -g | head -2
-      - name: Install uv, Harbor, PLE kit
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.local/bin:$PATH"
-          uv tool install harbor==0.20.0 --with websockets >/dev/null
-          git clone -q --depth 1 https://github.com/google-research/ple "$RUNNER_TEMP/ple"
-          (cd "$RUNNER_TEMP/ple" && uv sync -q)
       - name: Kit check
         if: inputs.mode == 'check'
         working-directory: harness
@@ -121,8 +131,21 @@ jobs:
         # only shows the final score table.
         run: |
           set +e
+          # Keepalive: the Kaggle server stops after 75 idle min, and a long
+          # task image build makes no model calls. A 1-token request every
+          # 20 min counts as activity; it ends with this step.
+          if [ -n "${KAGGLE_LLM_URL:-}" ]; then
+            ( while sleep 1200; do
+                curl -s -m 60 -o /dev/null -H "Authorization: Bearer $KAGGLE_LLM_KEY" -H 'Content-Type: application/json' \
+                  -d '{"model":"gemma","messages":[{"role":"user","content":"ok"}],"max_tokens":1}' \
+                  "${KAGGLE_LLM_URL%/}/v1/chat/completions" && echo "keepalive $(date -u +%H:%M)" >> "$RUNNER_TEMP/keepalive.log"
+              done ) &
+            KA=$!
+          fi
           KIT="$RUNNER_TEMP/ple" bash tools/dev_free.sh > "$RUNNER_TEMP/devrun_full.log" 2>&1
           rc=$?
+          [ -n "${KA:-}" ] && kill $KA 2>/dev/null
+          df -h / /mnt | tail -2
           sed -n '/^task  *score/,/^results:/p' "$RUNNER_TEMP/devrun_full.log" | grep -v '^results:'
           echo "exit code $rc"
           exit 0
@@ -136,6 +159,7 @@ jobs:
           NAME="$(date -u +%Y%m%d-%H%M%S)-${{ inputs.label }}-${{ matrix.task }}-${GITHUB_RUN_ID}"
           R=$(ls -d "$RUNNER_TEMP"/ple/runs/*/ 2>/dev/null | tail -1 || true)
           cp "$RUNNER_TEMP/devrun_full.log" "$OUT/devrun.log" 2>/dev/null || true
+          cp "$RUNNER_TEMP/keepalive.log" "$OUT/" 2>/dev/null || true
           tail -n 200 /tmp/proxy.log > "$OUT/proxy_tail.log" 2>/dev/null || true
           [ -n "$R" ] && cp "$R/results.json" "$OUT/results.json" 2>/dev/null || true
           [ -n "$R" ] && tar -czf "$OUT/run.tar.gz" -C "$R" . 2>/dev/null || true

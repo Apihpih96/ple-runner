@@ -26,6 +26,9 @@ on:
       kaggle_url:
         description: "optional: tunnel URL of the Kaggle server (normally found automatically)"
         default: ""
+      wait_min:
+        description: "llm=kaggle: minutes to wait for the Kaggle server to come up (it has taken over an hour from Save & Run All)"
+        default: "150"
 # Runs share one free key, so a new run waits for the one before it.
 concurrency:
   group: free-gemini-key
@@ -95,10 +98,17 @@ jobs:
           KAGGLE_LLM_PRIVKEY: ${{ secrets.KAGGLE_LLM_PRIVKEY }}
           LLM: ${{ inputs.llm }}
           URL_IN: ${{ inputs.kaggle_url }}
+          WAIT_MIN: ${{ inputs.wait_min }}
         run: |
           pip install -q pynacl
-          # The server publishes ~5-10 min after it starts; with llm=kaggle wait up to 20 min.
-          ok=1; for i in $(seq 1 40); do python3 runner/kaggle/endpoint.py --github && { ok=0; break; }; [ "$LLM" = kaggle ] || break; sleep 30; done
+          # Kaggle can sit in "Starting..." for an hour before the server publishes.
+          # With llm=kaggle wait up to wait_min (runner minutes are free on this
+          # public repo; the agent itself needs ~40 min of the 355-min job).
+          n=$(( ${WAIT_MIN:-150} * 2 )); t0=$(date +%s)
+          ok=1; for i in $(seq 1 $n); do python3 runner/kaggle/endpoint.py --github 2>/dev/null && { ok=0; break; }; [ "$LLM" = kaggle ] || break
+            [ $((i % 20)) = 0 ] && echo "still waiting for the Kaggle server ($(( ($(date +%s)-t0)/60 )) min)"; sleep 30; done
+          python3 runner/kaggle/endpoint.py >/dev/null || true
+          echo "waited $(( ($(date +%s)-t0)/60 )) min for the server"
           if [ $ok = 0 ]; then
             if [ -n "$URL_IN" ]; then echo "::add-mask::$URL_IN"; echo "KAGGLE_LLM_URL=$URL_IN" >> "$GITHUB_ENV"; fi
             echo "model: Kaggle GPU Gemma 4 26B"

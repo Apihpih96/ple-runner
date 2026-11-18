@@ -97,7 +97,9 @@ jobs:
           URL_IN: ${{ inputs.kaggle_url }}
         run: |
           pip install -q pynacl
-          if python3 runner/kaggle/endpoint.py --github; then
+          # The server publishes ~5-10 min after it starts; with llm=kaggle wait up to 20 min.
+          ok=1; for i in $(seq 1 40); do python3 runner/kaggle/endpoint.py --github && { ok=0; break; }; [ "$LLM" = kaggle ] || break; sleep 30; done
+          if [ $ok = 0 ]; then
             if [ -n "$URL_IN" ]; then echo "::add-mask::$URL_IN"; echo "KAGGLE_LLM_URL=$URL_IN" >> "$GITHUB_ENV"; fi
             echo "model: Kaggle GPU Gemma 4 26B"
           elif [ "$LLM" = kaggle ]; then

@@ -21,6 +21,9 @@ LLAMA_TAG = os.environ.get("LLAMA_TAG", "b12405")
 MODEL_REPO = "google/gemma-4-26B-A4B-it-qat-q4_0-gguf"
 MODEL_FILE = "gemma-4-26B_q4_0-it.gguf"
 CTX_TRY = [int(x) for x in os.environ.get("CTX_TRY", "131072,98304,65536,32768").split(",")]
+# Split modes to try, in order. "auto" benchmarks tensor then layer and keeps the faster one
+# for an agent turn (long prompt + medium answer); falls back to layer if tensor fails.
+SPLIT_MODE = os.environ.get("SPLIT_MODE", "auto")
 IDLE_MIN = float(os.environ.get("IDLE_MIN", "75"))
 MAX_HOURS = float(os.environ.get("MAX_HOURS", "11.6"))
 PORT = 8080
@@ -116,16 +119,16 @@ def get(url, key=None, data=None, timeout=10):
         return json.loads(r.read() or b"{}")
 
 
-def start_server(exe, model, key):
+def start_server(exe, model, key, mode="layer", wait_s=1200):
     for ctx in CTX_TRY:
         args = [exe, "-m", model, "--host", "127.0.0.1", "--port", str(PORT), "--api-key", key,
-                "-ngl", "999", "--split-mode", "layer", "-c", str(ctx), "-np", "1",
+                "-ngl", "999", "--split-mode", mode, "-c", str(ctx), "-np", "1",
                 "-fa", "on", "--jinja", "--metrics", "--no-webui", "-a", "gemma-4-26b",
                 "-b", "2048", "-ub", "512"]
-        log(f"start llama-server ctx={ctx}")
+        log(f"start llama-server mode={mode} ctx={ctx}")
         logf = open(f"{WORK}/server.log", "w")
         p = subprocess.Popen(args, stdout=logf, stderr=subprocess.STDOUT)
-        for _ in range(600):
+        for _ in range(wait_s // 2):
             if p.poll() is not None:
                 break
             try:
@@ -136,10 +139,10 @@ def start_server(exe, model, key):
                 pass
             time.sleep(2)
         tail = open(f"{WORK}/server.log").read()[-1500:]
-        log("server failed at ctx", ctx, "\n", re.sub(r"[A-Za-z0-9_-]{40,}", "<redacted>", tail))
+        log("server failed, mode", mode, "ctx", ctx, "\n", re.sub(r"[A-Za-z0-9_-]{40,}", "<redacted>", tail))
         p.kill()
         p.wait()
-    raise SystemExit("llama-server could not start at any context size")
+    raise RuntimeError(f"llama-server could not start in {mode} mode at any context size")
 
 
 # ---------- 3. speed ----------
@@ -155,6 +158,8 @@ def bench(key):
            "prompt_tok_s": round(tm.get("prompt_per_second", 0), 1),
            "gen_tok_s": round(tm.get("predicted_per_second", 0), 1),
            "wall_s": round(time.time() - t, 1)}
+    text = ((r.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    res["sane"] = len(text.split()) >= 40 and len(set(text.split())) >= 20
     log("bench", res)
     return res
 
@@ -204,12 +209,57 @@ def counters(key):
         return None, 0
 
 
+def turn_cost(sp):
+    """Seconds for a typical agent turn: 6k new prompt tokens + 600 generated."""
+    if not sp.get("sane") or not sp.get("prompt_tok_s") or not sp.get("gen_tok_s"):
+        return float("inf")
+    return 6000 / sp["prompt_tok_s"] + 600 / sp["gen_tok_s"]
+
+
+def stop(p):
+    p.terminate()
+    try:
+        p.wait(30)
+    except Exception:
+        p.kill()
+        p.wait()
+
+
+def pick_server(exe, model, key):
+    modes = ["tensor", "layer"] if SPLIT_MODE == "auto" else [SPLIT_MODE]
+    best = None  # (cost, mode, speed)
+    for i, mode in enumerate(modes):
+        last = i == len(modes) - 1
+        try:
+            srv, ctx = start_server(exe, model, key, mode, wait_s=1200 if last else 300)
+        except RuntimeError as e:
+            log(str(e))
+            continue
+        try:
+            sp = bench(key)
+        except Exception as e:
+            log("bench failed in", mode, type(e).__name__)
+            sp = {"sane": False}
+        sp["split_mode"] = mode
+        cost = turn_cost(sp)
+        log(f"mode={mode} ctx={ctx} est_turn_s={cost:.1f}")
+        if last and (best is None or cost <= best[0]):
+            return srv, ctx, sp          # last mode tried is at least as good: keep it running
+        stop(srv)
+        if best is None or cost < best[0]:
+            best = (cost, mode, sp)
+    if best is None:
+        raise SystemExit("llama-server could not start in any split mode")
+    log("restarting with faster mode", best[1])
+    srv, ctx = start_server(exe, model, key, best[1])
+    return srv, ctx, best[2]
+
+
 def main():
     key = "sk-" + secrets.token_urlsafe(32)
     exe = get_llama()
     model = get_model()
-    srv, ctx = start_server(exe, model, key)
-    speed = bench(key)
+    srv, ctx, speed = pick_server(exe, model, key)
     tun, url = start_tunnel()
     if not url:
         raise SystemExit("tunnel gave no URL")

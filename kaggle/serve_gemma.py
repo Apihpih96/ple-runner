@@ -119,8 +119,8 @@ def get(url, key=None, data=None, timeout=10):
         return json.loads(r.read() or b"{}")
 
 
-def start_server(exe, model, key, mode="layer", wait_s=1200):
-    for ctx in CTX_TRY:
+def start_server(exe, model, key, mode="layer", wait_s=1200, ctx_list=None):
+    for ctx in (ctx_list or CTX_TRY):
         args = [exe, "-m", model, "--host", "127.0.0.1", "--port", str(PORT), "--api-key", key,
                 "-ngl", "999", "--split-mode", mode, "-c", str(ctx), "-np", "1",
                 "-fa", "on", "--jinja", "--metrics", "--no-webui", "-a", "gemma-4-26b",
@@ -231,7 +231,10 @@ def pick_server(exe, model, key):
     for i, mode in enumerate(modes):
         last = i == len(modes) - 1
         try:
-            srv, ctx = start_server(exe, model, key, mode, wait_s=1200 if last else 300)
+            # A trial mode gets one try at the largest context (tensor also splits the KV
+            # cache, so it fits wherever layer does); no quota spent stepping down sizes.
+            srv, ctx = start_server(exe, model, key, mode, wait_s=1200 if last else 300,
+                                    ctx_list=None if last else CTX_TRY[:1])
         except RuntimeError as e:
             log(str(e))
             continue
@@ -251,7 +254,12 @@ def pick_server(exe, model, key):
     if best is None:
         raise SystemExit("llama-server could not start in any split mode")
     log("restarting with faster mode", best[1])
-    srv, ctx = start_server(exe, model, key, best[1])
+    try:
+        srv, ctx = start_server(exe, model, key, best[1], ctx_list=CTX_TRY[:1])
+    except RuntimeError as e:  # trial mode would not come back: use layer, which always works
+        log(str(e), "- falling back to layer")
+        srv, ctx = start_server(exe, model, key, "layer")
+        best = (None, "layer", bench(key))
     return srv, ctx, best[2]
 
 
